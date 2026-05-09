@@ -1,6 +1,6 @@
 ---
 name: hardware-debug-waveform
-description: Use when analyzing a hardware failure from a waveform dump (`.vcd` or `.fst`), a XiangShan-style Chisel source tree, optional emitted RTL, and optional simulator error logs such as simulator_out.txt. Handles difftest and assert triage, waveform-to-RTL ownership lookup, cache-aware artifact planning, and rough RTL-to-Chisel recovery.
+description: Use when analyzing a hardware failure from a waveform dump (`.vcd` or `.fst`), XiangShan simulator logs, or when the user says "xs ci run wave" and provides an XS CI result path. Handles difftest/assert triage, waveform-to-RTL ownership lookup, and CI failed-checkpoint reruns.
 ---
 
 # Hardware Debug Waveform
@@ -17,6 +17,177 @@ Core approach:
 - use generated SystemVerilog only as a fallback
 
 ## Workflow
+
+### Fast Path - `xs ci run wave`
+
+If the user says `xs ci run wave`, `xs ci result`, asks to rerun failed XS CI checkpoints, or asks to create wave/debug runs from an XS CI result directory, use this flow before the waveform-analysis flow.
+
+Required input:
+
+- XS CI result directory path. It must contain `score.txt`, `emu`, `riscv64-nemu-interpreter-so`, and per-checkpoint result directories.
+
+If the path is missing, ask only for:
+
+```text
+Please provide the XS CI result path, for example:
+/nfs/home/share/.../timing-fix-report/<run-name>
+```
+
+#### 1. Inspect the result directory
+
+From the result directory:
+
+```bash
+cd /path/to/xs-ci-result
+sed -n '1,90p' score.txt
+ls -lh emu riscv64-nemu-interpreter-so
+```
+
+Parse `score.txt`:
+
+- `Unfinished / Aborted Tests` gives the failed benchmark names and point ids.
+- `Checkpoint Version` gives the checkpoint profile name.
+- The checkpoint root is usually:
+
+```bash
+/nfs/home/share/checkpoints_profiles/<Checkpoint Version>/checkpoint-0-0-0/
+```
+
+For each failed item, locate the GEM image with `find` instead of reconstructing the full decimal suffix exactly:
+
+```bash
+find "$GCPT" -path "*/<benchmark>/<point>/_<point>_*.zstd" -print -quit
+```
+
+Example:
+
+```bash
+GCPT=/nfs/home/share/checkpoints_profiles/spec06_gcc15_rv64gcb_base_260122/checkpoint-0-0-0/
+find "$GCPT" -path "*/h264ref_sss/159971/_159971_*.zstd" -print -quit
+```
+
+This avoids mismatches such as score coverage `0.0798411` while the checkpoint file is `_159971_0.079841_.zstd`.
+
+#### 2. Choose a server
+
+Use the user's `zzqxstop` helper to inspect server load:
+
+```bash
+EXECUTE_CURRENT_NODE=n /nfs/home/zhengzhongqiang/Work/script/zzqxstop
+```
+
+Choose a reachable node with `cores > 256`, preferring the lowest load. If SSH to the best node is not permitted, use the best already-approved reachable node and state that choice.
+
+#### 3. Create one debug directory per failed checkpoint
+
+For each failed checkpoint create:
+
+```text
+<case-name>_debug/
+  run_debug.sh
+  launch_local.sh
+  simulator_out.txt
+  simulator_err.txt
+  launch.info
+  emu.pid
+```
+
+Case-name convention:
+
+```text
+<benchmark>_<point>_<coverage>_debug
+```
+
+Use the score coverage string for the directory name, but use `find` to locate the actual `.zstd`.
+
+`run_debug.sh` template:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+GEM=/path/to/checkpoint.zstd
+GCPT=/nfs/home/share/checkpoints_profiles/<Checkpoint Version>/checkpoint-0-0-0/
+
+cd "$(dirname "$0")"
+
+../emu \
+  --enable-fork \
+  --diff ../riscv64-nemu-interpreter-so \
+  -i "$GEM" \
+  -W 20000000 \
+  -I 40000000 \
+  -r "$GCPT" \
+  -s 4564 \
+  > simulator_out.txt \
+  2> simulator_err.txt
+```
+
+`launch_local.sh` template:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+{
+  date
+  hostname
+} > launch.info
+
+nohup ./run_debug.sh > launch.log 2>&1 &
+echo "$!" > emu.pid
+echo "started pid $(cat emu.pid) on $(hostname)"
+```
+
+Make both scripts executable:
+
+```bash
+chmod +x <case>_debug/run_debug.sh <case>_debug/launch_local.sh
+```
+
+#### 4. Launch on the chosen server
+
+Run one launch command per failed checkpoint:
+
+```bash
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no <node> \
+  /path/to/xs-ci-result/<case>_debug/launch_local.sh
+```
+
+Then verify each wrapper has an emu child:
+
+```bash
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no <node> \
+  "ps -p <wrapper-pids> -o pid,ppid,stat,etime,time,cmd"
+
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no <node> \
+  "pgrep -P <wrapper-pid> -a"
+```
+
+Also verify each `simulator_out.txt` has the right checkpoint and that `--enable-fork` took effect by checking for lines like:
+
+```text
+The image is ...
+DRAMsim3 memory system initialized.
+Overwrite 3584 bytes ...
+The reference model is ../riscv64-nemu-interpreter-so
+```
+
+If output stops at `DRAMsim3 memory system initialized.` and never reaches `The reference model is ...`, check that `--enable-fork` is present.
+
+#### 5. Report
+
+Report:
+
+- selected node and why
+- every failed checkpoint found in `score.txt`
+- debug directory for each case
+- wrapper PID and emu child PID for each launched case
+- where to tail logs
+
+Do not kill existing remote runs unless the user asks. If the user asks to stop a prior run, terminate the wrapper and its emu child together, then verify no matching process remains.
 
 ### Step0 - Resolve Input
 
