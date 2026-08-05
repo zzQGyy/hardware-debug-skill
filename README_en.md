@@ -57,6 +57,41 @@ window-len: 1000
 
 If the user only says "debug this" without enough inputs, prefer asking them to fill in this template instead of asking an open-ended free-form question.
 
+## Debug Convergence Principle
+
+An assert, difftest mismatch, or abort is the failure scene: first prove the trigger condition at that scene, then recursively backtrace upstream from the abnormal signal in that condition. Each hop must answer:
+
+- the exact waveform time where the current signal/state is wrong;
+- the actual wrong value and the expected correct value;
+- the immediate upstream signals or state, classified as `meets expectation`, `violates expectation`, or `unknown/not observable`;
+- how the upstream values propagate into the current error;
+- whether this hop is a downstream symptom or a source candidate.
+
+Search `violates expectation` branches first with depth-first search, then necessary `unknown/not observable` branches. Record `meets expectation` branches as exclusion evidence and do not search them unless all abnormal branches are ruled out. If a branch cannot explain the downstream failure, backtrack to the nearest branch point and search the next violating or unknown branch.
+
+Converge to root cause only when a source candidate has normal or excluded inputs and its wrong value is sufficient to explain the downstream chain. The final conclusion must name the bug-triggering code, the boundary scenario, and the fix or next validation patch.
+
+Every strong conclusion must have both code evidence and waveform evidence:
+
+- Code evidence: Scala/Chisel source, emitted RTL, generated expression, instance wiring, or protocol invariant explaining how the signal should be produced.
+- Waveform evidence: exact FST/GTKWave signal, exact waveform time, actual value, and expected value proving the behavior occurred.
+- Only a closed code-plus-waveform evidence chain can support a root-cause conclusion. Code-only reasoning is a hypothesis; waveform-only observation is a symptom.
+
+Align the three naming layers before citing any proof signal:
+
+- Chisel/Scala layer: design source signal or expression.
+- emitted RTL layer: generated Verilog/SystemVerilog signal, assign, concat/mux, or instance port wiring.
+- FST/GTKWave layer: exact waveform hierarchy signal.
+
+Use the FST/GTKWave hierarchy signal as the primary evidence key in the report. Use Chisel/Scala and emitted RTL names only in mapping tables, source-logic explanations, or parenthetical aliases after the mapping is established. Do not interchange the three namespaces in the same reasoning step.
+
+Watch these pitfalls:
+
+- the simulator report/abort cycle is the failure scene, but may not be the first cycle containing the bad combination;
+- for ready/valid queues, distinguish valid before the clock edge from empty after dequeue;
+- for dynamic indexes such as `_GEN_3[auto_out_r_bits_id]`, prove the selected signal from the Chisel `VecInit(...)(rid)`, emitted RTL concat/mux, and instance wiring;
+- use exact GTKWave/FST hierarchy names, e.g. do not write `foo[6:0]` when the signal is `foo [6:0]`.
+
 
 
 ### Where Artifacts Are Stored

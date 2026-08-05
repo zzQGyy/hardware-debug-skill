@@ -16,6 +16,12 @@ Core approach:
 - use Scala/Chisel source as the primary material for root-cause analysis
 - use generated SystemVerilog only as a fallback
 
+**REQUIRED SUB-SKILL:** Use `xiangshan-wave-signal-mapper` when the task needs exact Chisel/Scala-to-FST/GTKWave signal hierarchy mapping, facname extraction from `.fst`, or a waveform search checklist from generated signal names.
+
+**REQUIRED SUB-SKILL:** Use `xiangshan-debug-report-writer` when the user asks for a written debug report, verification document, Chinese analysis report, or a reusable record of root-cause backtrace, waveform evidence, expected vs observed values, signal meaning, propagation relation, and confidence.
+
+**REQUIRED SUB-SKILL:** Use `xiangshan-gtkwave-savefile-generator` when the user asks for a GTKWave `.gtkw` view, grouped waveform signals, color-highlighted proof signals, marker placement, or repair of a savefile that opens with markers but no signals.
+
 ## Workflow
 
 ### Fast Path - `xs ci run wave`
@@ -78,7 +84,20 @@ EXECUTE_CURRENT_NODE=n /nfs/home/zhengzhongqiang/Work/script/zzqxstop
 
 Choose a reachable node with `cores > 256`, preferring the lowest load. If SSH to the best node is not permitted, use the best already-approved reachable node and state that choice.
 
-#### 3. Create one debug directory per failed checkpoint
+#### 3. Choose the rerun mode and create one directory per failed checkpoint
+
+First choose exactly one rerun mode. Default to `perf-rerun`, so reruns produce `[PERF]` counters and remain score/report compatible. Switch away from `perf-rerun` only when the user explicitly asks for waveform capture or LightSSS fork debugging.
+
+- `perf-rerun`: default mode for score/report compatibility, IPC comparison, and `[PERF]` counters. Always include `--force-dump-result`.
+- `wave-rerun`: use this only when the user wants a waveform around a failing window.
+- `fork-debug-rerun`: use this only when the user wants LightSSS fork debugging for an actual abort/assert window.
+
+Do not mix the modes in one command. In particular:
+
+- Do not combine `--enable-fork` with `-b/-e` and `--dump-wave`.
+- Do not add `--wave-path`; for this workflow it is not effective. Wave dumps are created under `build/` in the directory selected by `export NOOP_HOME="$PWD"`.
+- Do not use `--dump-wave-full` unless the user explicitly asks for a full waveform and accepts the very large output size.
+- Keep `[PERF]` counters enabled by default with `--force-dump-result`; prefer `perf-rerun` without wave/fork flags unless the user asks for another mode.
 
 For each failed checkpoint create:
 
@@ -100,7 +119,7 @@ Case-name convention:
 
 Use the score coverage string for the directory name, but use `find` to locate the actual `.zstd`.
 
-`run_debug.sh` template:
+`perf-rerun` template, suitable for scoring and `[PERF]` counters:
 
 ```bash
 #!/usr/bin/env bash
@@ -110,6 +129,59 @@ GEM=/path/to/checkpoint.zstd
 GCPT=/nfs/home/share/checkpoints_profiles/<Checkpoint Version>/checkpoint-0-0-0/
 
 cd "$(dirname "$0")"
+export NOOP_HOME="$PWD"
+
+../emu \
+  --diff ../riscv64-nemu-interpreter-so \
+  -i "$GEM" \
+  -W 20000000 \
+  -I 40000000 \
+  -r "$GCPT" \
+  -s 4564 \
+  --force-dump-result \
+  > simulator_out.txt \
+  2> simulator_err.txt
+```
+
+`wave-rerun` template, suitable for a bounded waveform window:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+GEM=/path/to/checkpoint.zstd
+GCPT=/nfs/home/share/checkpoints_profiles/<Checkpoint Version>/checkpoint-0-0-0/
+LOG_BEGIN=123456
+LOG_END=124456
+
+cd "$(dirname "$0")"
+export NOOP_HOME="$PWD"
+
+../emu \
+  --diff ../riscv64-nemu-interpreter-so \
+  -i "$GEM" \
+  -W 20000000 \
+  -I 40000000 \
+  -r "$GCPT" \
+  -s 4564 \
+  -b "$LOG_BEGIN" \
+  -e "$LOG_END" \
+  --dump-wave \
+  > simulator_out.txt \
+  2> simulator_err.txt
+```
+
+`fork-debug-rerun` template, suitable for LightSSS abort/assert debugging:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+GEM=/path/to/checkpoint.zstd
+GCPT=/nfs/home/share/checkpoints_profiles/<Checkpoint Version>/checkpoint-0-0-0/
+
+cd "$(dirname "$0")"
+export NOOP_HOME="$PWD"
 
 ../emu \
   --enable-fork \
@@ -237,7 +309,7 @@ window-len: 1000
 All commands run from the skill root directory. Use `cd` once at the start:
 
 ```bash
-cd ~/.codex/skills/hardware-debug-waveform
+cd ~/.codex/skills/hardware-skill/debug/hardware-debug-skill-no-pywellen
 ```
 
 ### Step 1 — Inspect inputs
@@ -343,6 +415,95 @@ Only run this step if a rough mapping artifact is available. Treat results as gu
 
 If you need a point lookup instead of a time-range packet, use `query-signal-value`.
 
+### Step 6a - Root-Cause Backtrace Contract
+
+After classifying the bug type, use that type only to choose the starting point and first source files. Do not let the type replace evidence.
+
+Start from the final assert, difftest mismatch, abort, or violated invariant as the failure scene. Treat it as the first observable failure site, not as the root cause by default. Then recursively walk backward one causal hop at a time:
+
+- name the current bad signal or state
+- give the exact waveform time where it is bad
+- give the actual wrong value observed in the waveform
+- give the expected correct value or correct behavior from the protocol, invariant, Scala/Chisel source, or emitted RTL
+- list the immediate upstream signals or state that generate it, as explicit branch candidates
+- classify each branch candidate as `meets expectation`, `violates expectation`, or `unknown/not observable`
+- explain the propagation relation from upstream to current signal
+- continue depth-first only on `violates expectation` branches first, then on necessary `unknown/not observable` branches
+- record `meets expectation` branches as exclusion evidence and do not continue into them unless all abnormal branches are ruled out
+- if a searched branch cannot explain the downstream failure, backtrack to the nearest branch point and search the next violating or unknown branch
+- decide whether the current hop is only a downstream symptom or a source candidate
+
+Stop the backtrace only when the earliest abnormal source candidate satisfies both conditions:
+
+- its inputs or earlier prerequisites are normal, unavailable, or explicitly ruled out
+- its actual wrong value is sufficient to propagate through the observed downstream chain to the final failure
+
+The final conclusion must name the bug-triggering code, the boundary scenario that activates it, and the proposed fix or next validation patch.
+
+Every strong debug conclusion must close both sides of the evidence chain:
+
+- Code evidence: Scala/Chisel source, emitted RTL, generated expression, instance wiring, or protocol invariant explaining how the signal is produced.
+- Waveform evidence: exact FST/GTKWave signal, exact waveform time, actual value, and expected value proving the behavior occurred.
+- Code-only reasoning is a hypothesis. Waveform-only observation is a symptom. Only a code-plus-waveform chain can support a root-cause conclusion.
+
+For every proof signal, align the three naming layers before citing it:
+
+- Chisel/Scala layer: design source signal or expression.
+- emitted RTL layer: generated Verilog/SystemVerilog signal, assign, concat/mux, or instance port wiring.
+- FST/GTKWave layer: exact waveform hierarchy signal.
+
+Use the exact FST/GTKWave signal as the primary evidence key in the analysis. Use Chisel/Scala and emitted RTL names only in mapping tables, source-logic explanations, or parenthetical aliases after the mapping is established. Do not mix Chisel, RTL, and GTKWave names interchangeably in the same reasoning step.
+
+If the waveform lacks an internal Chisel `val`, use exact generated FST signals, nearby handshakes, registered outputs, or probe signals. Use `xiangshan-wave-signal-mapper` to turn Chisel/Scala names into exact GTKWave hierarchy names before citing them.
+
+### Step 6a.1 - Waveform Boundary and Dynamic-Index Discipline
+
+When debugging a final assert generated from a Chisel dynamic index, do not stop at "selected queue is empty" and do not infer the selected queue from the id name alone.
+
+Apply these checks before writing the conclusion:
+
+- Treat the assert/difftest report as the failure scene and prove its trigger condition first. Then check whether an earlier bad combination exists in the waveform and use that as the next backtrace hop.
+- Query exact point values around the boundary with `query-signal-value`, especially the last legal handshake, the first bad trigger-condition cycle, and the report/abort cycle.
+- For ready/valid queues, distinguish "valid before the clock edge" from "empty after a dequeue." A legal `last=1` beat with `deq.valid=1` and `do_deq=1` can empty the queue; a later same-id non-last beat is a new protocol violation, not proof the earlier queue was wrong.
+- For generated expressions such as `_GEN_3[auto_out_r_bits_id]`, map the Chisel source and emitted RTL together:
+  - Chisel dynamic select, e.g. `VecInit(rqueues.map(_.deq.valid))(rid)`
+  - emitted RTL concat or mux that builds `_GEN_3`
+  - instance wiring that proves which queue signal corresponds to the selected bit
+- If the selected signal name contains a generated suffix or vector width, use the exact FST path. Do not cite `foo[6:0]` when the FST signal is `foo [6:0]`.
+
+For AXI read-response asserts, the minimal boundary table should include:
+
+| Role | Signals |
+| --- | --- |
+| final assert inputs | `out.r.valid`, `out.r.bits.id`, selected `r_valid`, `out.r.bits.last` |
+| queue state | selected queue `io_deq_valid`, `io_deq_ready`, `do_deq`, `empty`, pointers when useful |
+| protocol lifecycle | previous AR/fire or read-beat count, final legal `last=1` beat, first illegal extra beat |
+| propagation | upstream R-channel `valid/ready/id/last` at each boundary |
+
+### Step 6b - Bug-Source Proof Contract
+
+A claimed bug source must include all of these fields:
+
+- `Bug Type`: assert, difftest mismatch, abort, hang, deadlock, protocol violation, data corruption, or unknown
+- `Source Signal`: Chisel/Scala name and exact GTKWave/FST hierarchy
+- `Source Time`: exact waveform time
+- `Observed`: actual wrong value
+- `Expected`: expected correct value or behavior
+- `Source Logic`: Scala/Chisel source, and emitted RTL when needed, that defines the source signal
+- `Propagation`: how the wrong value reaches the final assert, mismatch, abort, or invariant failure
+- `Exclusion`: why later stages are symptoms rather than independent root causes
+
+Do not claim root cause from source logic alone. A root-cause claim needs waveform value evidence at a specific time plus source logic explaining why the value is wrong and how it propagates.
+
+### Step 6c - Evidence Signal Table
+
+For every debug conclusion, include a compact signal table. Use exact FST/GTKWave names as the primary key, not guessed Chisel names.
+
+| Role | Chisel/Scala signal | emitted RTL signal/expression | FST/GTKWave signal | signal meaning | expected correct value/behavior | actual wrong value/observation | exact waveform time | mapping proof | propagation relation |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+Keep this table focused on proof signals: final failure signal, each backtrace hop, the source candidate, and the key normal/ruling-out signals. Avoid dumping every nearby waveform signal.
+
 
 ## Output
 
@@ -356,6 +517,7 @@ Write the answer in two parts:
   - `Mismatching Instruction`: for `difftest_error`, report the mismatching PC and instruction
   - `Phenomenon`: one sentence describing the anomaly seen in the waveform
   - `Root Cause Category`: a standard hardware bug class such as state machine deadlock, data hazard, backpressure stall, or flush-handling miss
+  - `Root Cause Source`: source signal, exact waveform time, actual wrong value, and expected correct value
   - `Confidence`: state whether this is high confidence or low confidence
 - For an exploration request, include:
   - `Function`: what the module does
@@ -368,9 +530,12 @@ Write the answer in two parts:
   1. Expand the `Bug Type Hint`, `Assert Site` / `Mismatching Instruction`, and `Root Cause Category` from the summary.
   2. For `assert_error`, explain the trigger condition from emitted Verilog first, then show the matching Scala/Chisel logic.
   3. For `difftest_error`, explain the ROB commit-path chain you traced from Scala/Chisel to waveform.
-  4. Cite the most relevant error-log clues, waveform evidence, and Scala/Chisel logic that support the hypothesis.
-  5. Give a fix recommendation if confidence is high.
-  6. Otherwise give the next best debugging steps.
+  4. Perform the Step 6a root-cause backtrace from final failure to earliest abnormal source candidate.
+  5. Prove the source with the Step 6b fields: exact waveform time, actual wrong value, expected correct value, source logic, propagation relation, and exclusion evidence.
+  6. Include the Step 6c evidence signal table with exact FST/GTKWave hierarchy names and signal meaning.
+  7. Cite the most relevant error-log clues, waveform evidence, and Scala/Chisel logic that support the hypothesis.
+  8. Give a fix recommendation if confidence is high.
+  9. Otherwise give the next best debugging steps.
 - For an exploration request:
   1. Support `Function` by using the Scala/Chisel source to explain what the module does, and by using waveform evidence to analyze its key pipeline signals and timing behavior when sufficient evidence is available.
   2. Support `Structure` with the main state, buffers, queues, or submodules.
@@ -388,6 +553,8 @@ Include only the few source files or artifact paths that materially support the 
 
 - Let `inspect-inputs` choose default artifact paths; only override when the user asks.
 - If `--error-log` is provided, use it to infer a likely bug type, but do not treat it as sufficient proof.
+- Do not present a root cause unless it is supported by both code evidence and waveform evidence. If either side is missing, label the result as a hypothesis or next debugging step.
+- Do not mix Chisel, emitted RTL, and FST/GTKWave names without a mapping table. Establish the three-layer mapping first, then use the FST/GTKWave name consistently as the evidence key.
 - If the error log indicates `assert_error`, treat the asserted RTL file/line as the first narrowing clue.
 - If the error log indicates `assert_error`, try to generate `assert_debug_guide.md` and `waveform_search_signals.txt` in the same directory as `simulator_out.txt`.
 - If the error log indicates `difftest_error`, use mismatch or abort PC as a starting hint, but confirm the root cause from waveform and source.

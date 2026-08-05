@@ -57,6 +57,41 @@ window-len: 1000
 
 如果用户只说“帮我 debug”但没有给足输入，优先让他按这个模板填写，而不是自由描述。
 
+## 调试收敛原则
+
+assert / difftest / abort 是第一现场：先证明这个现场的触发条件，再从触发条件里的异常信号开始向上游递归回溯。每一跳都必须回答：
+
+- 当前异常信号在什么 exact waveform time 出错；
+- actual wrong value 和 expected correct value 分别是什么；
+- 直接上游信号/状态是什么，以及它们分别是 `meets expectation`、`violates expectation` 还是 `unknown/not observable`；
+- 上游如何传导成当前错误；
+- 这个点是 downstream symptom 还是 source candidate。
+
+对 `violates expectation` 的分支优先 depth-first search；必要时再查 `unknown/not observable` 分支。`meets expectation` 的分支应记录为 exclusion evidence，不继续深搜。若当前分支无法解释下游失败，回到最近分叉点，换另一个异常或未知方向继续查。
+
+只有当某个 source candidate 的输入正常或已被排除，并且它的错误值足以解释后续传播链时，才收敛为 root cause。最终结论必须给出 bug-triggering code、触发边界场景、修复方法或下一步验证补丁。
+
+所有强结论都必须同时有代码依据和波形依据：
+
+- 代码依据：Scala/Chisel 源码、emitted RTL、生成表达式、实例连接或协议不变量，说明这个信号应该如何产生；
+- 波形依据：exact FST/GTKWave signal、exact waveform time、actual value、expected value，证明这个行为确实发生；
+- 只有“代码 + 波形”闭合的证据链才能作为 root cause 结论依据。只有代码推理只能作为 hypothesis，只有波形现象只能作为 symptom。
+
+每个 proof signal 必须先完成三层对齐：
+
+- Chisel/Scala 层：设计源码里的信号或表达式；
+- emitted RTL 层：生成后的 Verilog/SystemVerilog 信号、assign、concat/mux 或实例端口连接；
+- FST/GTKWave 层：波形中 exact hierarchy signal。
+
+正文推理统一使用 FST/GTKWave 层次信号名作为证据主键。Chisel/Scala 和 emitted RTL 名字只在映射表、source logic 或括号说明里出现。不要在同一段推理中无说明地交叉使用三套名字。
+
+特别注意：
+
+- simulator report/abort cycle 是第一现场，但不一定是第一个坏组合出现的 cycle；
+- ready/valid queue 要区分 clock edge 前的 valid 和 dequeue 后的 empty；
+- 对 `_GEN_3[auto_out_r_bits_id]` 这类动态索引，必须结合 Chisel `VecInit(...)(rid)`、emitted RTL concat/mux 和实例端口连接证明选择了哪个信号；
+- FST 信号名必须使用 exact GTKWave hierarchy，不能把 `foo [6:0]` 写成 `foo[6:0]`。
+
 
 ### 构建的临时产物存放位置
 
