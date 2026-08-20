@@ -1,0 +1,3 @@
+[submodule "hardware-debug-skill-no-pywellen"]
+	path = hardware-debug-skill-no-pywellen
+	url = git@github.com:zzQGyy/hardware-debug-skill.git
