@@ -1,0 +1,4 @@
+interface:
+  display_name: "XiangShan Wave Signal Mapper"
+  short_description: "Map Chisel names to FST/GTKWave signals"
+  default_prompt: "Use $xiangshan-wave-signal-mapper to map these Chisel signal names to exact FST/GTKWave hierarchy."

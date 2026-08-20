@@ -1,0 +1,4 @@
+interface:
+  display_name: "XiangShan Debug Report Writer"
+  short_description: "Write Chinese waveform debug reports"
+  default_prompt: "Use $xiangshan-debug-report-writer to turn this XiangShan waveform debug analysis into a Chinese verification report."

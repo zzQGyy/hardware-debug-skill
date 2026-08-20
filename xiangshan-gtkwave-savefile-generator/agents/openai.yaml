@@ -1,0 +1,4 @@
+interface:
+  display_name: "XiangShan GTKWave Savefile Generator"
+  short_description: "Create GTKWave savefiles for XiangShan hardware debug waveforms."
+  default_prompt: "Generate a grouped GTKWave savefile for this XiangShan waveform and debug target."
